@@ -1,0 +1,24 @@
+# Prometheus Adapter Helm values for custom-metric HPA
+#
+# Install via:
+#   helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+#   helm install prometheus-adapter prometheus-community/prometheus-adapter \
+#     -n monitoring -f k8s/custom-metrics-adapter.yaml
+
+prometheus:
+  url: http://prometheus.monitoring.svc.cluster.local
+  port: 9090
+
+rules:
+  custom:
+    - seriesQuery: 'inference_queue_depth{namespace!="",pod!=""}'
+      resources:
+        overrides:
+          namespace:
+            resource: namespace
+          pod:
+            resource: pod
+      name:
+        matches: "inference_queue_depth"
+        as: "inference_queue_depth"
+      metricsQuery: 'avg_over_time(inference_queue_depth{<<.LabelMatchers>>}[2m])'

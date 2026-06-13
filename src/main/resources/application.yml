@@ -1,0 +1,33 @@
+spring:
+  application:
+    name: dynamic-batching-inference-server
+  mvc:
+    async:
+      request-timeout: 60000
+
+server:
+  port: 8080
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, prometheus, info, metrics
+  endpoint:
+    prometheus:
+      enabled: true
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+    distribution:
+      percentiles-histogram:
+        inference.request.latency: true
+      percentiles:
+        inference.request.latency: 0.5, 0.95, 0.99
+
+inference:
+  batch:
+    max-batch-size: 8
+    max-wait-ms: 50
+    processing-threads: 2
