@@ -18,6 +18,7 @@ spec:
         prometheus.io/port: "8080"
         prometheus.io/path: /actuator/prometheus
     spec:
+      terminationGracePeriodSeconds: 45
       containers:
         - name: server
           image: your-registry/dynamic-batching-inference-server:latest
@@ -28,6 +29,14 @@ spec:
               value: "8"
             - name: INFERENCE_BATCH_MAX_WAIT_MS
               value: "50"
+            - name: INFERENCE_BATCH_REQUEST_TIMEOUT_MS
+              value: "30000"
+            - name: INFERENCE_BATCH_SHUTDOWN_GRACE_PERIOD_MS
+              value: "25000"
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 5"]
           resources:
             requests:
               cpu: 500m

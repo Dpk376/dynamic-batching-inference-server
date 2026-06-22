@@ -1,12 +1,15 @@
 spring:
   application:
     name: dynamic-batching-inference-server
+  lifecycle:
+    timeout-per-shutdown-phase: 35s
   mvc:
     async:
       request-timeout: 60000
 
 server:
   port: 8080
+  shutdown: graceful
 
 management:
   endpoints:
@@ -14,6 +17,9 @@ management:
       exposure:
         include: health, prometheus, info, metrics
   endpoint:
+    health:
+      probes:
+        enabled: true
     prometheus:
       enabled: true
   metrics:
@@ -23,11 +29,18 @@ management:
     distribution:
       percentiles-histogram:
         inference.request.latency: true
+        inference.request.queue.wait: true
+        inference.batch.processing: true
       percentiles:
         inference.request.latency: 0.5, 0.95, 0.99
+        inference.request.queue.wait: 0.5, 0.95, 0.99
+        inference.batch.processing: 0.5, 0.95, 0.99
 
 inference:
   batch:
     max-batch-size: 8
     max-wait-ms: 50
     processing-threads: 2
+    max-outstanding-requests: 1024
+    request-timeout-ms: 30000
+    shutdown-grace-period-ms: 25000

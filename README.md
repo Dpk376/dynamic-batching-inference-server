@@ -7,6 +7,9 @@ A production-grade LLM inference server built with **Java 17 / Spring Boot 3** t
 | Feature | Detail |
 |---------|--------|
 | Dynamic batching | `DynamicBatchScheduler` flushes when `maxBatchSize` is reached **or** `maxWaitMs` elapses, whichever comes first |
+| Admission control | Rejects excess work with HTTP `429` when the configured outstanding-request limit is reached |
+| Request deadlines | Fails requests with HTTP `504` when their end-to-end inference deadline expires |
+| Graceful shutdown | Stops admission, flushes queued work, and drains active requests before pod termination |
 | Async API | `/v1/infer` returns a `CompletableFuture` — callers block only until their request completes within the batch |
 | Prometheus metrics | `inference_queue_depth`, `inference_batch_size`, `inference_tokens_per_second`, `inference_request_latency_seconds` |
 | Kubernetes HPA | Scales on the `inference_queue_depth` custom metric (via Prometheus Adapter) between 2–20 replicas |
@@ -100,12 +103,50 @@ inference:
     max-batch-size: 8       # flush when this many requests are queued
     max-wait-ms: 50         # flush after this many ms even if batch is not full
     processing-threads: 2   # worker threads for batch execution
+    max-outstanding-requests: 1024 # queued + pending + in-flight admission limit
+    request-timeout-ms: 30000 # end-to-end deadline from admission to completion
+    shutdown-grace-period-ms: 25000 # drain window before remaining requests fail
 ```
 
 Environment variable overrides (Kubernetes):
 ```
 INFERENCE_BATCH_MAX_BATCH_SIZE=16
 INFERENCE_BATCH_MAX_WAIT_MS=25
+INFERENCE_BATCH_MAX_OUTSTANDING_REQUESTS=1024
+INFERENCE_BATCH_REQUEST_TIMEOUT_MS=30000
+INFERENCE_BATCH_SHUTDOWN_GRACE_PERIOD_MS=25000
+```
+
+When capacity is exhausted, `/v1/infer` returns HTTP `429 Too Many Requests`,
+a `Retry-After: 1` header, and:
+
+```json
+{
+  "code": "CAPACITY_EXHAUSTED",
+  "message": "Inference capacity is exhausted; maximum outstanding requests: 1024",
+  "requestId": "uuid"
+}
+```
+
+During shutdown, new requests receive HTTP `503 Service Unavailable`:
+
+```json
+{
+  "code": "SERVICE_DRAINING",
+  "message": "Inference server is draining and cannot accept new requests",
+  "requestId": "uuid"
+}
+```
+
+When the inference deadline expires, `/v1/infer` returns HTTP
+`504 Gateway Timeout`:
+
+```json
+{
+  "code": "REQUEST_TIMEOUT",
+  "message": "Inference request exceeded its 30000ms deadline",
+  "requestId": "uuid"
+}
 ```
 
 ## Metrics
@@ -113,10 +154,20 @@ INFERENCE_BATCH_MAX_WAIT_MS=25
 | Metric | Type | Description |
 |--------|------|-------------|
 | `inference_queue_depth` | Gauge | Requests currently waiting to be batched |
+| `inference_requests_outstanding` | Gauge | Accepted requests not yet completed |
+| `inference_requests_rejected_total` | Counter | Requests rejected by reason |
+| `inference_requests_timed_out_total` | Counter | Requests whose inference deadline expired |
+| `inference_requests_failed_on_shutdown_total` | Counter | Requests failed after the drain grace period |
+| `inference_scheduler_draining` | Gauge | `1` while the scheduler is draining, otherwise `0` |
 | `inference_batches_total` | Counter | Total number of batches dispatched |
+| `inference_batches_failed_total` | Counter | Batches that failed during processing |
+| `inference_batches_in_flight` | Gauge | Batches currently executing |
 | `inference_batch_size` | DistributionSummary | Distribution of batch sizes |
-| `inference_request_latency_seconds` | Timer | End-to-end request latency (p50/p95/p99) |
-| `inference_tokens_per_second` | Gauge | Rolling tokens/sec across all batches |
+| `inference_batch_processing_seconds` | Timer | Backend batch processing duration |
+| `inference_request_queue_wait_seconds` | Timer | Admission-to-worker wait, including executor backlog |
+| `inference_request_latency_seconds` | Timer | End-to-end latency tagged by outcome |
+| `inference_tokens_generated_total` | Counter | Successfully generated output tokens |
+| `inference_tokens_per_second` | Gauge | Output throughput of the most recently completed batch |
 
 ## Kubernetes Deployment
 

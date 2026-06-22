@@ -7,7 +7,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 @RestController
 @RequestMapping("/v1")
@@ -20,10 +20,10 @@ public class InferenceController {
     }
 
     @PostMapping("/infer")
-    public CompletableFuture<ResponseEntity<InferenceResponse>> infer(@RequestBody InferenceRequest request) {
+    public SseEmitter infer(@RequestBody InferenceRequest request) {
         if (request.getRequestId() == null) {
             request.setRequestId(UUID.randomUUID().toString());
         }
-        return scheduler.enqueue(request).thenApply(ResponseEntity::ok);
+        return scheduler.enqueue(request);
     }
 }

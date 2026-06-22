@@ -11,4 +11,7 @@ public class BatchProperties {
     private int maxBatchSize = 8;
     private long maxWaitMs = 50L;
     private int processingThreads = 2;
+    private int maxOutstandingRequests = 1024;
+    private long requestTimeoutMs = 30_000L;
+    private long shutdownGracePeriodMs = 25_000L;
 }

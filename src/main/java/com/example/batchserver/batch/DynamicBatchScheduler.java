@@ -11,6 +11,7 @@ import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -46,6 +47,10 @@ public class DynamicBatchScheduler {
         this.meterRegistry = meterRegistry;
     }
 
+    Set<BatchedRequest> getActiveRequests() {
+        return activeRequests;
+    }
+
     @PostConstruct
     public void start() {
         admissionPermits = new Semaphore(props.getMaxOutstandingRequests(), true);
@@ -79,7 +84,7 @@ public class DynamicBatchScheduler {
                 props.getShutdownGracePeriodMs());
     }
 
-    public CompletableFuture<InferenceResponse> enqueue(InferenceRequest request) {
+    public SseEmitter enqueue(InferenceRequest request) {
         synchronized (lifecycleLock) {
             ensureAcceptingRequests(request);
             return admitRequest(request);
@@ -93,17 +98,24 @@ public class DynamicBatchScheduler {
         }
     }
 
-    private CompletableFuture<InferenceResponse> admitRequest(InferenceRequest request) {
+    private SseEmitter admitRequest(InferenceRequest request) {
         if (!admissionPermits.tryAcquire()) {
             meterRegistry.counter("inference.requests.rejected", "reason", "capacity").increment();
             throw new SchedulerOverloadedException(request.getRequestId(), props.getMaxOutstandingRequests());
         }
-        CompletableFuture<InferenceResponse> future = new CompletableFuture<>();
+        
+        SseEmitter emitter = new SseEmitter(props.getRequestTimeoutMs());
+        CompletableFuture<Void> lifecycleFuture = new CompletableFuture<>();
         outstandingRequests.incrementAndGet();
 
-        BatchedRequest batchedRequest = new BatchedRequest(request, future, System.nanoTime());
+        BatchedRequest batchedRequest = new BatchedRequest(request, emitter, lifecycleFuture, System.nanoTime());
         activeRequests.add(batchedRequest);
-        future.whenComplete((response, error) -> {
+        
+        emitter.onCompletion(() -> lifecycleFuture.complete(null));
+        emitter.onTimeout(() -> lifecycleFuture.completeExceptionally(new InferenceRequestTimeoutException(request.getRequestId(), props.getRequestTimeoutMs())));
+        emitter.onError(lifecycleFuture::completeExceptionally);
+        
+        lifecycleFuture.whenComplete((response, error) -> {
             recordRequestLatency(batchedRequest, error);
             releaseRequest(batchedRequest);
         });
@@ -112,12 +124,12 @@ public class DynamicBatchScheduler {
                 () -> timeoutRequest(batchedRequest),
                 props.getRequestTimeoutMs(),
                 TimeUnit.MILLISECONDS);
-        future.whenComplete((response, error) -> timeoutTask.cancel(false));
+        lifecycleFuture.whenComplete((response, error) -> timeoutTask.cancel(false));
 
         if (queue.size() >= props.getMaxBatchSize()) {
             controlExecutor.submit(this::flushBatch);
         }
-        return future;
+        return emitter;
     }
 
     private void recordRequestLatency(BatchedRequest batchedRequest, Throwable error) {
@@ -158,11 +170,13 @@ public class DynamicBatchScheduler {
         InferenceRequestTimeoutException timeoutException = new InferenceRequestTimeoutException(
                 batchedRequest.getRequestId(),
                 props.getRequestTimeoutMs());
-        boolean timedOut = batchedRequest.getFuture().completeExceptionally(timeoutException);
+        
+        boolean timedOut = batchedRequest.getLifecycleFuture().completeExceptionally(timeoutException);
         if (!timedOut) {
             return;
         }
 
+        batchedRequest.getEmitter().completeWithError(timeoutException);
         queue.remove(batchedRequest);
         meterRegistry.counter("inference.requests.timed_out").increment();
         log.debug("Inference request timed out: requestId={}", batchedRequest.getRequestId());
@@ -184,7 +198,7 @@ public class DynamicBatchScheduler {
     private void processActiveRequests(List<BatchedRequest> batch) {
         List<BatchedRequest> activeRequests = new ArrayList<>(batch.size());
         for (BatchedRequest batchedRequest : batch) {
-            if (!batchedRequest.getFuture().isDone()) {
+            if (!batchedRequest.getLifecycleFuture().isDone()) {
                 activeRequests.add(batchedRequest);
             }
         }
@@ -248,7 +262,8 @@ public class DynamicBatchScheduler {
         for (BatchedRequest batchedRequest : activeRequests) {
             SchedulerDrainingException shutdownException =
                     new SchedulerDrainingException(batchedRequest.getRequestId());
-            if (batchedRequest.getFuture().completeExceptionally(shutdownException)) {
+            if (batchedRequest.getLifecycleFuture().completeExceptionally(shutdownException)) {
+                batchedRequest.getEmitter().completeWithError(shutdownException);
                 failedRequests++;
             }
         }

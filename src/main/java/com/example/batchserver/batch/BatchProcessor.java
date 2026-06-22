@@ -2,6 +2,7 @@ package com.example.batchserver.batch;
 
 import com.example.batchserver.model.BatchedRequest;
 import com.example.batchserver.model.InferenceResponse;
+import com.example.batchserver.model.TokenEvent;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -53,10 +54,9 @@ public class BatchProcessor {
         batchesTotal.increment();
         inFlightBatches.incrementAndGet();
         try {
-            runInference(batch);
+            int generatedTokens = runInference(batch);
             meterRegistry.summary("inference.batch.size").record(batch.size());
             long processingNanos = System.nanoTime() - processingStartedAtNanos;
-            int generatedTokens = countGeneratedTokens(batch);
             generatedTokensTotal.increment(generatedTokens);
             updateTokensPerSecond(generatedTokens, processingNanos);
             log.debug("Batch of {} processed in {}ms",
@@ -66,7 +66,8 @@ public class BatchProcessor {
             meterRegistry.counter("inference.batches.failed").increment();
             log.error("Batch processing failed: {}", exception.getMessage(), exception);
             for (BatchedRequest batchedRequest : batch) {
-                batchedRequest.getFuture().completeExceptionally(exception);
+                batchedRequest.getEmitter().completeWithError(exception);
+                batchedRequest.getLifecycleFuture().completeExceptionally(exception);
             }
         } finally {
             long processingNanos = System.nanoTime() - processingStartedAtNanos;
@@ -82,20 +83,6 @@ public class BatchProcessor {
         }
     }
 
-    private int countGeneratedTokens(List<BatchedRequest> batch) {
-        int generatedTokens = 0;
-        for (BatchedRequest batchedRequest : batch) {
-            if (batchedRequest.getFuture().isCancelled()
-                    || batchedRequest.getFuture().isCompletedExceptionally()) {
-                continue;
-            }
-            InferenceResponse response = batchedRequest.getFuture().getNow(null);
-            if (response != null) {
-                generatedTokens += response.getOutputTokens();
-            }
-        }
-        return generatedTokens;
-    }
 
     private void updateTokensPerSecond(int generatedTokens, long processingNanos) {
         if (processingNanos <= 0) {
@@ -107,30 +94,60 @@ public class BatchProcessor {
     }
 
     // Simulation stub — replace with a real WebClient or gRPC call to your model backend
-    private void runInference(List<BatchedRequest> batch) {
+    private int runInference(List<BatchedRequest> batch) {
         long baseMs = 80 + (long) (Math.random() * 60);
-        long perItemMs = 15;
-        long totalMs = baseMs + perItemMs * batch.size();
 
         try {
-            Thread.sleep(totalMs);
+            Thread.sleep(baseMs);
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
             throw new IllegalStateException("Batch inference was interrupted", exception);
         }
 
-        for (BatchedRequest batchedRequest : batch) {
-            long endToEndLatencyMs = TimeUnit.NANOSECONDS.toMillis(
-                    System.nanoTime() - batchedRequest.getAdmittedAtNanos());
-            batchedRequest.getFuture().complete(InferenceResponse.builder()
-                    .requestId(batchedRequest.getRequestId())
-                    .generatedText("[ response for " + batchedRequest.getRequestId() + " ]")
-                    .inputTokens(countTokens(batchedRequest.getRequest().getPrompt()))
-                    .outputTokens(batchedRequest.getRequest().getMaxTokens())
-                    .latencyMs(endToEndLatencyMs)
-                    .batchSize(batch.size())
-                    .build());
+        int maxTokensInBatch = batch.stream()
+                .mapToInt(req -> req.getRequest().getMaxTokens())
+                .max().orElse(0);
+
+        int generatedTokens = 0;
+
+        for (int tokenIndex = 0; tokenIndex < maxTokensInBatch; tokenIndex++) {
+            try {
+                Thread.sleep(15);
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Batch inference was interrupted", exception);
+            }
+
+            for (BatchedRequest batchedRequest : batch) {
+                if (batchedRequest.getLifecycleFuture().isDone()) {
+                    continue;
+                }
+
+                int requestMaxTokens = batchedRequest.getRequest().getMaxTokens();
+                if (tokenIndex < requestMaxTokens) {
+                    boolean isFinal = (tokenIndex == requestMaxTokens - 1);
+                    TokenEvent event = new TokenEvent(
+                            batchedRequest.getRequestId(),
+                            " token" + tokenIndex,
+                            tokenIndex,
+                            isFinal
+                    );
+
+                    try {
+                        batchedRequest.getEmitter().send(event);
+                        generatedTokens++;
+                        if (isFinal) {
+                            batchedRequest.getEmitter().complete();
+                            batchedRequest.getLifecycleFuture().complete(null);
+                        }
+                    } catch (Exception e) {
+                        log.debug("Client disconnected for request {}", batchedRequest.getRequestId());
+                        batchedRequest.getLifecycleFuture().completeExceptionally(e);
+                    }
+                }
+            }
         }
+        return generatedTokens;
     }
 
     private int countTokens(String text) {
