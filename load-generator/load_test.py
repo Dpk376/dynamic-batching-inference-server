@@ -7,6 +7,7 @@ Usage:
 """
 import argparse
 import asyncio
+import json
 import random
 import statistics
 import time
@@ -30,6 +31,7 @@ PROMPTS = [
 async def send_request(
     session: aiohttp.ClientSession,
     url: str,
+    ttfts: list,
     latencies: list,
     errors: list,
     tokens: list,
@@ -46,14 +48,32 @@ async def send_request(
             json=payload,
             timeout=aiohttp.ClientTimeout(total=30),
         ) as resp:
-            data = await resp.json()
+            resp.raise_for_status()
+            ttft_recorded = False
+            token_count = 0
+            
+            async for line in resp.content:
+                line_str = line.decode('utf-8').strip()
+                if not line_str or not line_str.startswith('data:'):
+                    continue
+                data_str = line_str[5:].strip()
+                try:
+                    event = json.loads(data_str)
+                    if not ttft_recorded:
+                        ttfts.append((time.monotonic() - start) * 1000)
+                        ttft_recorded = True
+                    token_count += 1
+                except json.JSONDecodeError:
+                    pass
+            
             latencies.append((time.monotonic() - start) * 1000)
-            tokens.append(data.get("outputTokens", 0))
+            tokens.append(token_count)
     except Exception as exc:
         errors.append(str(exc))
 
 
 async def run(url: str, rps: int, duration: int) -> None:
+    ttfts: list = []
     latencies: list = []
     errors: list = []
     tokens: list = []
@@ -66,7 +86,7 @@ async def run(url: str, rps: int, duration: int) -> None:
         tasks = []
         while time.monotonic() < deadline:
             tasks.append(asyncio.create_task(
-                send_request(session, url, latencies, errors, tokens)
+                send_request(session, url, ttfts, latencies, errors, tokens)
             ))
             await asyncio.sleep(interval)
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -77,14 +97,28 @@ async def run(url: str, rps: int, duration: int) -> None:
         return
 
     sorted_lat = sorted(latencies)
+    sorted_ttft = sorted(ttfts)
     print("\n=== Load Test Results ===")
     print(f"Target RPS:     {rps}")
     print(f"Duration:       {duration}s")
     print(f"Total requests: {total}")
     print(f"Errors:         {len(errors)} ({100 * len(errors) / total:.1f}%)")
-    print(f"p50 latency:    {statistics.median(latencies):.1f} ms")
-    print(f"p95 latency:    {sorted_lat[int(0.95 * len(sorted_lat))]:.1f} ms")
-    print(f"p99 latency:    {sorted_lat[int(0.99 * len(sorted_lat))]:.1f} ms")
+    
+    if sorted_ttft:
+        print(f"p50 TTFT:       {statistics.median(sorted_ttft):.1f} ms")
+        print(f"p95 TTFT:       {sorted_ttft[int(0.95 * len(sorted_ttft))]:.1f} ms")
+        print(f"p99 TTFT:       {sorted_ttft[int(0.99 * len(sorted_ttft))]:.1f} ms")
+    
+    print(f"p50 E2E latency:{statistics.median(latencies):.1f} ms")
+    print(f"p95 E2E latency:{sorted_lat[int(0.95 * len(sorted_lat))]:.1f} ms")
+    print(f"p99 E2E latency:{sorted_lat[int(0.99 * len(sorted_lat))]:.1f} ms")
+    
+    total_latency_excluding_ttft = sum(latencies) - sum(ttfts)
+    total_tokens_generated_after_first = sum(tokens) - len(tokens)
+    if total_tokens_generated_after_first > 0:
+        avg_tbt = total_latency_excluding_ttft / total_tokens_generated_after_first
+        print(f"Avg TBT:        {avg_tbt:.1f} ms")
+        
     print(f"Throughput:     {sum(tokens) / duration:.1f} tokens/sec")
 
 
